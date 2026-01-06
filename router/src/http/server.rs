@@ -8,6 +8,9 @@ use crate::http::types::{
     SimilarityRequest, SimilarityResponse, SimpleToken, SparseValue, TokenizeInput,
     TokenizeRequest, TokenizeResponse, TruncationDirection, VertexPrediction, VertexRequest,
     VertexResponse,
+    // Cohere compatible types
+    CohereRerankRequest, CohereRerankResponse, CohereRerankResult, CohereRerankDocument,
+    CohereApiVersion, CohereBilledUnits, CohereMeta,
 };
 use crate::{
     logging, shutdown, ClassifierModel, EmbeddingModel, ErrorResponse, ErrorType, Info, ModelType,
@@ -504,6 +507,276 @@ async fn rerank(
 
         (
             RerankResponse(ranks),
+            ResponseMetadata::new(
+                compute_chars,
+                total_compute_tokens,
+                start_time,
+                Duration::from_nanos(total_tokenization_time / batch_size),
+                Duration::from_nanos(total_queue_time / batch_size),
+                Duration::from_nanos(total_inference_time / batch_size),
+            ),
+        )
+    };
+
+    metadata.record_span(&span);
+    metadata.record_metrics();
+
+    let headers = HeaderMap::from(metadata);
+
+    tracing::info!("Success");
+
+    Ok((headers, Json(response)))
+}
+
+/// Cohere Compatible Rerank API
+/// This endpoint provides full compatibility with the Cohere Rerank API format.
+/// See: https://docs.cohere.com/reference/rerank
+#[utoipa::path(
+post,
+tag = "Text Embeddings Inference",
+path = "/v1/rerank",
+request_body = CohereRerankRequest,
+responses(
+(status = 200, description = "Cohere Compatible Rerank Results", body = CohereRerankResponse),
+(status = 424, description = "Rerank Error", body = ErrorResponse,
+example = json ! ({"error": "Inference failed", "error_type": "backend"})),
+(status = 429, description = "Model is overloaded", body = ErrorResponse,
+example = json ! ({"error": "Model is overloaded", "error_type": "overloaded"})),
+(status = 422, description = "Tokenization error", body = ErrorResponse,
+example = json ! ({"error": "Tokenization error", "error_type": "tokenizer"})),
+(status = 400, description = "Batch is empty", body = ErrorResponse,
+example = json ! ({"error": "Batch is empty", "error_type": "empty"})),
+(status = 413, description = "Batch size error", body = ErrorResponse,
+example = json ! ({"error": "Batch size error", "error_type": "validation"})),
+)
+)]
+#[instrument(
+    skip_all,
+    fields(total_time, tokenization_time, queue_time, inference_time,)
+)]
+async fn cohere_rerank(
+    infer: Extension<Infer>,
+    info: Extension<Info>,
+    Extension(context): Extension<Option<opentelemetry::Context>>,
+    Json(req): Json<CohereRerankRequest>,
+) -> Result<(HeaderMap, Json<CohereRerankResponse>), (StatusCode, Json<ErrorResponse>)> {
+    let span = tracing::Span::current();
+    if let Some(context) = context {
+        span.set_parent(context);
+    }
+
+    let start_time = Instant::now();
+
+    if req.documents.is_empty() {
+        let message = "`documents` cannot be empty".to_string();
+        tracing::error!("{message}");
+        let err = ErrorResponse {
+            error: message,
+            error_type: ErrorType::Empty,
+        };
+        let counter = metrics::counter!("te_request_failure", "err" => "validation");
+        counter.increment(1);
+        Err(err)?;
+    }
+
+    // Check model type
+    match &info.model_type {
+        ModelType::Classifier(classifier) => {
+            if classifier.id2label.len() > 1 {
+                let message =
+                    "Rerank is not compatible with multi-class classification models".to_string();
+                tracing::error!("{message}");
+                Err(ErrorResponse {
+                    error: message,
+                    error_type: ErrorType::Backend,
+                })?;
+            }
+        }
+        ModelType::Reranker(_) | ModelType::ListwiseReranker(_) => {}
+        ModelType::Embedding(_) => {
+            let message = format!(
+                "model {} is not a classifier model",
+                info.model_id
+            );
+            tracing::error!("{message}");
+            Err(ErrorResponse {
+                error: message,
+                error_type: ErrorType::Backend,
+            })?;
+        }
+    }
+
+    // Apply template if needed for Qwen3 rerankers
+    let model_id = info.model_id.clone();
+    let use_template = req.use_template.unwrap_or_else(|| {
+        text_embeddings_core::templates::requires_template(&model_id)
+    });
+    tracing::info!("Cohere Rerank request: model_id={}, use_template={}", model_id, use_template);
+
+    // Closure for rerank
+    let rerank_inner = move |query: String,
+                             text: String,
+                             truncate: bool,
+                             instruction: Option<String>,
+                             model_id: String,
+                             infer: Infer,
+                             batch_counter: Option<Arc<AtomicUsize>>| async move {
+        let permit = infer.try_acquire_permit().map_err(ErrorResponse::from)?;
+
+        // Apply template formatting if needed
+        let input: text_embeddings_core::tokenization::EncodingInput = if use_template {
+            if let Some(formatter) = text_embeddings_core::templates::get_template_formatter(&model_id) {
+                let formatted = formatter.format_rerank(&query, &text, instruction.as_deref());
+                formatted.into()
+            } else {
+                (query, text).into()
+            }
+        } else {
+            (query, text).into()
+        };
+
+        let response = infer
+            .predict(
+                input,
+                truncate,
+                req.truncation_direction.into(),
+                req.raw_scores,
+                permit,
+                batch_counter,
+            )
+            .await
+            .map_err(ErrorResponse::from)?;
+
+        let score = response.results[0];
+
+        Ok::<(usize, Duration, Duration, Duration, f32), ErrorResponse>((
+            response.metadata.prompt_tokens,
+            response.metadata.tokenization,
+            response.metadata.queue,
+            response.metadata.inference,
+            score,
+        ))
+    };
+
+    let truncate = req.truncate.unwrap_or(info.auto_truncate);
+
+    let (response, metadata) = {
+        let counter = metrics::counter!("te_request_count", "method" => "batch");
+        counter.increment(1);
+
+        let batch_size = req.documents.len();
+        if batch_size > info.max_client_batch_size {
+            let message = format!(
+                "batch size {batch_size} > maximum allowed batch size {}",
+                info.max_client_batch_size
+            );
+            tracing::error!("{message}");
+            let err = ErrorResponse {
+                error: message,
+                error_type: ErrorType::Validation,
+            };
+            let counter = metrics::counter!("te_request_failure", "err" => "batch_size");
+            counter.increment(1);
+            Err(err)?;
+        }
+
+        let batch_counter = if batch_size == 1 {
+            None
+        } else {
+            Some(Arc::new(AtomicUsize::new(batch_size)))
+        };
+        let mut futures = Vec::with_capacity(batch_size);
+        let query_chars = req.query.chars().count();
+        let mut compute_chars = query_chars * batch_size;
+
+        // Extract text from documents
+        let texts: Vec<String> = req.documents.iter().map(|d| d.text().to_string()).collect();
+
+        for text in &texts {
+            compute_chars += text.chars().count();
+            let local_infer = infer.clone();
+            let local_batch_counter = batch_counter.clone();
+            futures.push(rerank_inner(
+                req.query.clone(),
+                text.clone(),
+                truncate,
+                req.instruction.clone(),
+                model_id.clone(),
+                local_infer.0,
+                local_batch_counter,
+            ))
+        }
+        let results = join_all(futures)
+            .await
+            .into_iter()
+            .collect::<Result<Vec<(usize, Duration, Duration, Duration, f32)>, ErrorResponse>>()?;
+
+        let mut ranks = Vec::with_capacity(batch_size);
+        let mut total_tokenization_time = 0;
+        let mut total_queue_time = 0;
+        let mut total_inference_time = 0;
+        let mut total_compute_tokens = 0;
+
+        for (index, r) in results.into_iter().enumerate() {
+            total_compute_tokens += r.0;
+            total_tokenization_time += r.1.as_nanos() as u64;
+            total_queue_time += r.2.as_nanos() as u64;
+            total_inference_time += r.3.as_nanos() as u64;
+            
+            let document = if req.return_documents {
+                Some(CohereRerankDocument {
+                    text: texts[index].clone(),
+                })
+            } else {
+                None
+            };
+
+            let score = r.4;
+            // Check that score is not NaN
+            if score.is_nan() {
+                Err(ErrorResponse {
+                    error: "score is NaN".to_string(),
+                    error_type: ErrorType::Backend,
+                })?;
+            }
+
+            ranks.push(CohereRerankResult { 
+                index, 
+                relevance_score: score,
+                document,
+            })
+        }
+
+        // Reverse sort by relevance_score
+        ranks.sort_by(|x, y| x.relevance_score.partial_cmp(&y.relevance_score).unwrap());
+        ranks.reverse();
+
+        // Apply top_n if specified
+        if let Some(top_n) = req.top_n {
+            ranks.truncate(top_n);
+        }
+
+        let batch_size = batch_size as u64;
+
+        let counter = metrics::counter!("te_request_success", "method" => "batch");
+        counter.increment(1);
+
+        // Generate unique request ID
+        let request_id = format!("req_{:x}", start_time.elapsed().as_nanos());
+
+        (
+            CohereRerankResponse {
+                id: request_id,
+                results: ranks,
+                meta: CohereMeta {
+                    api_version: CohereApiVersion {
+                        version: "1",
+                    },
+                    billed_units: CohereBilledUnits {
+                        search_units: batch_size as usize,
+                    },
+                },
+            },
             ResponseMetadata::new(
                 compute_chars,
                 total_compute_tokens,
@@ -1713,6 +1986,7 @@ pub async fn run(
     health,
     predict,
     rerank,
+    cohere_rerank,
     embed,
     embed_all,
     embed_sparse,
@@ -1747,6 +2021,13 @@ pub async fn run(
     RerankRequest,
     Rank,
     RerankResponse,
+    CohereRerankRequest,
+    CohereRerankResult,
+    CohereRerankDocument,
+    CohereRerankResponse,
+    CohereMeta,
+    CohereApiVersion,
+    CohereBilledUnits,
     EmbedRequest,
     EmbedResponse,
     ErrorResponse,
@@ -1844,6 +2125,8 @@ pub async fn run(
         // OpenAI compat route
         .route("/embeddings", post(openai_embed))
         .route("/v1/embeddings", post(openai_embed))
+        // Cohere compat rerank route
+        .route("/v1/rerank", post(cohere_rerank))
         // Vertex compat route
         .route("/vertex", post(vertex_compatibility));
 

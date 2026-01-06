@@ -283,6 +283,147 @@ pub(crate) struct Rank {
 #[derive(Serialize, ToSchema)]
 pub(crate) struct RerankResponse(pub Vec<Rank>);
 
+// ============================================================================
+// Cohere Compatible Rerank Types
+// ============================================================================
+
+/// Cohere compatible document input - can be a string or an object with text field
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+#[serde(untagged)]
+pub(crate) enum CohereDocument {
+    /// Plain text document
+    Text(String),
+    /// Document object with text field
+    Object {
+        text: String,
+        #[serde(flatten)]
+        #[allow(dead_code)]
+        extra: std::collections::HashMap<String, serde_json::Value>,
+    },
+}
+
+impl CohereDocument {
+    pub fn text(&self) -> &str {
+        match self {
+            CohereDocument::Text(s) => s,
+            CohereDocument::Object { text, .. } => text,
+        }
+    }
+}
+
+/// Cohere compatible rerank request
+/// See: https://docs.cohere.com/reference/rerank
+#[derive(Deserialize, ToSchema)]
+pub(crate) struct CohereRerankRequest {
+    /// The identifier of the model to use
+    #[schema(nullable = true, example = "rerank-english-v3.0")]
+    #[allow(dead_code)]
+    pub model: Option<String>,
+    
+    /// The search query
+    #[schema(example = "What is Deep Learning?")]
+    pub query: String,
+    
+    /// A list of documents to rerank
+    #[schema(example = json!(["Deep Learning is ...", "Machine learning ..."]))]
+    pub documents: Vec<CohereDocument>,
+    
+    /// The number of most relevant documents to return (default: all)
+    #[schema(nullable = true, example = "3")]
+    pub top_n: Option<usize>,
+    
+    /// If true, returns the documents in the response
+    #[serde(default)]
+    #[schema(default = "false", example = "false")]
+    pub return_documents: bool,
+    
+    /// Maximum number of chunks per document (not used, for compatibility)
+    #[allow(dead_code)]
+    #[schema(nullable = true)]
+    pub max_chunks_per_doc: Option<usize>,
+    
+    /// Fields to use for ranking when documents are objects (not used, for compatibility)
+    #[allow(dead_code)]
+    #[schema(nullable = true)]
+    pub rank_fields: Option<Vec<String>>,
+
+    // TEI specific extensions
+    #[serde(default)]
+    #[schema(default = "false", example = "false", nullable = true)]
+    pub truncate: Option<bool>,
+    #[serde(default)]
+    #[schema(default = "right", example = "right")]
+    pub truncation_direction: TruncationDirection,
+    #[serde(default)]
+    #[schema(default = "false", example = "false")]
+    pub raw_scores: bool,
+    /// Custom instruction for reranking
+    #[serde(default)]
+    #[schema(nullable = true)]
+    pub instruction: Option<String>,
+    /// Whether to use the model's chat template
+    #[serde(default)]
+    #[schema(nullable = true)]
+    pub use_template: Option<bool>,
+}
+
+/// Cohere compatible rerank result
+#[derive(Serialize, ToSchema)]
+pub(crate) struct CohereRerankResult {
+    /// The index of the document in the original list
+    #[schema(example = "0")]
+    pub index: usize,
+    
+    /// The relevance score
+    #[schema(example = "0.98")]
+    pub relevance_score: f32,
+    
+    /// The document text (if return_documents is true)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = true)]
+    pub document: Option<CohereRerankDocument>,
+}
+
+/// Cohere compatible document in response
+#[derive(Serialize, ToSchema)]
+pub(crate) struct CohereRerankDocument {
+    pub text: String,
+}
+
+/// Cohere compatible API version info
+#[derive(Serialize, ToSchema)]
+pub(crate) struct CohereApiVersion {
+    pub version: &'static str,
+}
+
+/// Cohere compatible billing info
+#[derive(Serialize, ToSchema)]
+pub(crate) struct CohereBilledUnits {
+    pub search_units: usize,
+}
+
+/// Cohere compatible meta info
+#[derive(Serialize, ToSchema)]
+pub(crate) struct CohereMeta {
+    pub api_version: CohereApiVersion,
+    pub billed_units: CohereBilledUnits,
+}
+
+/// Cohere compatible rerank response
+/// See: https://docs.cohere.com/reference/rerank
+#[derive(Serialize, ToSchema)]
+pub(crate) struct CohereRerankResponse {
+    /// Unique identifier for the request
+    #[schema(example = "req_123")]
+    pub id: String,
+    
+    /// The reranked results
+    pub results: Vec<CohereRerankResult>,
+    
+    /// Meta information
+    pub meta: CohereMeta,
+}
+
 #[derive(Deserialize, ToSchema, Debug)]
 #[serde(untagged)]
 pub(crate) enum InputType {
