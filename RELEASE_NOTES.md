@@ -11,6 +11,41 @@ This release adds **native Qwen3-Reranker support** to Text Embeddings Inference
 - No model conversion required (but bfloat16 models need fp16 conversion for TEI)
 - Full CUDA/Flash Attention acceleration
 
+### 🆕 Cohere Compatible API (`/v1/rerank`)
+Full compatibility with the [Cohere Rerank API](https://docs.cohere.com/reference/rerank):
+
+```bash
+curl http://localhost:8080/v1/rerank \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "What is deep learning?",
+    "documents": ["Deep learning uses neural networks.", "Paris is capital."],
+    "top_n": 2,
+    "return_documents": true
+  }'
+```
+
+**Response:**
+```json
+{
+  "id": "req_abc123",
+  "results": [
+    {"index": 0, "relevance_score": 0.85, "document": {"text": "Deep learning..."}},
+    {"index": 1, "relevance_score": 0.001, "document": {"text": "Paris..."}}
+  ],
+  "meta": {"api_version": {"version": "1"}, "billed_units": {"search_units": 2}}
+}
+```
+
+**API Comparison:**
+| Feature | TEI `/rerank` | Cohere `/v1/rerank` |
+|---------|--------------|---------------------|
+| Documents input | `texts` | `documents` |
+| Return docs | `return_text` | `return_documents` |
+| Score field | `score` | `relevance_score` |
+| Limit results | ❌ | `top_n` |
+| Document objects | ❌ | `[{"text": "..."}]` |
+
 ### Implementation Details
 - **Generative Approach**: Extracts "yes"/"no" token logits from last position
 - **Scoring**: `P(yes) = softmax([logit_no, logit_yes])[1]`
