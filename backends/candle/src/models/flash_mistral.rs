@@ -251,6 +251,7 @@ impl FlashMistralModel {
                 candle::bail!("`classifier` model type is not supported for Mistral")
             }
             ModelType::Embedding(pool) => pool,
+            ModelType::ListwiseReranker => unreachable!("ListwiseReranker not supported for FlashMistral"),
         };
 
         let embeddings = Embedding::new(

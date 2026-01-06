@@ -450,6 +450,7 @@ impl MPNetModel {
                 }
                 pool
             }
+            ModelType::ListwiseReranker => unreachable!("ListwiseReranker not supported for MPNet"),
         };
 
         let (embeddings, encoder) = match (

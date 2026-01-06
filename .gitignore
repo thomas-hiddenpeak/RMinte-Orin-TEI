@@ -2,3 +2,8 @@
 target
 data/
 __pycache__/
+build.log
+build_clean.log
+build_cuda12.6.log
+build_cuda12.6_verbose.log
+log.txt

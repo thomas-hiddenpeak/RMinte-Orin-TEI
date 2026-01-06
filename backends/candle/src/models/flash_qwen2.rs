@@ -261,6 +261,7 @@ impl FlashQwen2Model {
                 candle::bail!("`classifier` model type is not supported for Qwen2")
             }
             ModelType::Embedding(pool) => pool,
+            ModelType::ListwiseReranker => unreachable!("ListwiseReranker not supported for FlashQwen2"),
         };
 
         // Pushing the prefix for `model` is apparently only required if the model architecture is

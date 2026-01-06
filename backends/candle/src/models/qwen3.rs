@@ -379,9 +379,11 @@ pub struct Qwen3Model {
     embeddings: Embedding,
     layers: Vec<Qwen3Layer>,
     norm: RMSNorm,
+    lm_head_weight: Tensor,
     rotary_cache: (Tensor, Tensor),
     rotary_dim: usize,
     pool: Pool,
+    model_type: ModelType,
     num_attention_heads: usize,
     pad_token_id: u32,
 
@@ -393,11 +395,12 @@ pub struct Qwen3Model {
 
 impl Qwen3Model {
     pub fn load(vb: VarBuilder, config: &Qwen3Config, model_type: ModelType) -> Result<Self> {
-        let pool = match model_type {
+        let pool = match &model_type {
             ModelType::Classifier => {
-                candle::bail!("`classifier` model type is not supported for Qwen3")
+                candle::bail!("Classifier model type is not supported for native Qwen3. Use ListwiseReranker for Qwen3-Reranker models.");
             }
-            ModelType::Embedding(pool) => pool,
+            ModelType::Embedding(pool) => pool.clone(),
+            ModelType::ListwiseReranker => Pool::LastToken,
         };
 
         // The Qwen3-Reranker models contain the `model` key
@@ -408,11 +411,13 @@ impl Qwen3Model {
             vb
         };
 
-        let embeddings = Embedding::new(
-            vb.pp("embed_tokens")
-                .get((config.vocab_size, config.hidden_size), "weight")?,
-            config.hidden_size,
-        );
+        let embed_weight = vb
+            .pp("embed_tokens")
+            .get((config.vocab_size, config.hidden_size), "weight")?;
+
+        let embeddings = Embedding::new(embed_weight.clone(), config.hidden_size);
+
+        let lm_head_weight = embed_weight;
 
         let layers = (0..config.num_hidden_layers)
             .map(|index| Qwen3Layer::load(vb.pp(format!("layers.{index}")), config))
@@ -433,9 +438,11 @@ impl Qwen3Model {
             embeddings,
             layers,
             norm,
+            lm_head_weight,
             rotary_cache,
             rotary_dim,
             pool,
+            model_type,
             pad_token_id: config.eos_token_id as u32,
             num_attention_heads: config.num_attention_heads,
             dtype: vb.dtype(),
@@ -699,5 +706,65 @@ impl Model for Qwen3Model {
 
     fn embed(&self, batch: Batch) -> Result<(Option<Tensor>, Option<Tensor>)> {
         self.forward(batch)
+    }
+
+    fn predict(&self, batch: Batch) -> Result<Tensor> {
+        match &self.model_type {
+            ModelType::ListwiseReranker => {
+                // Extract needed values before moving batch
+                let batch_size = batch.len();
+                let max_length = batch.max_length as usize;
+
+                // Use the existing forward method to get hidden states
+                let (_, raw_embeddings) = self.forward(batch)?;
+
+                let hidden_states = match raw_embeddings {
+                    Some(embeddings) => embeddings,
+                    None => candle::bail!("No hidden states returned from forward pass"),
+                };
+
+                // Project through LM head to get logits
+                let logits = hidden_states.matmul(&self.lm_head_weight.t()?)?;
+
+                // Token IDs for Qwen3 (verified from tokenizer)
+                // 'yes' -> 9693, 'no' -> 2152 (lowercase)
+                let yes_id = 9693u32;
+                let no_id = 2152u32;
+
+                // Extract logits for last position of each sequence
+                let mut scores_vec = Vec::with_capacity(batch_size);
+
+                for i in 0..batch_size {
+                    // For left-padded sequences, the last position contains the actual output
+                    let last_pos = max_length - 1;
+
+                    // Get logits for the last position
+                    let last_logits = logits.i((i, last_pos, ..))?;
+
+                    // Extract yes/no logits directly
+                    let yes_logit = last_logits.i(yes_id as usize)?;
+                    let no_logit = last_logits.i(no_id as usize)?;
+
+                    // Stack [no, yes] and apply log_softmax
+                    let logit_pair = Tensor::stack(&[&no_logit, &yes_logit], 0)?;
+                    let log_probs =
+                        candle_nn::ops::log_softmax(&logit_pair.unsqueeze(0)?, D::Minus1)?;
+
+                    // Extract yes probability (index 1) and exp to get P(yes)
+                    let yes_log_prob = log_probs.i((0, 1))?;
+                    let score = yes_log_prob.exp()?.to_scalar::<f32>()?;
+
+                    scores_vec.push(score);
+                }
+
+                // Convert to tensor with shape [batch_size, 1] for compatibility with to_vec2()
+                let scores = Tensor::from_vec(scores_vec, (batch_size, 1), &self.device)?;
+
+                Ok(scores)
+            }
+            _ => {
+                candle::bail!("`predict` is only supported for ListwiseReranker model type")
+            }
+        }
     }
 }

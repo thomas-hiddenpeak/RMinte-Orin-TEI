@@ -498,6 +498,7 @@ impl ModernBertModel {
 
                 (pool, None)
             }
+            ModelType::ListwiseReranker => unreachable!("ListwiseReranker not supported for ModernBert"),
         };
 
         let embeddings = ModernBertEmbeddings::load(vb.pp("model.embeddings"), config)

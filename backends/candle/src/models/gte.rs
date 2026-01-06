@@ -406,6 +406,7 @@ impl GTEModel {
                 (pool, Some(classifier))
             }
             ModelType::Embedding(pool) => (pool, None),
+            ModelType::ListwiseReranker => unreachable!("ListwiseReranker not supported for GTE"),
         };
 
         let (word_embeddings, token_type_embeddings, encoder, embeddings_norm) =

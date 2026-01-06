@@ -193,6 +193,7 @@ impl FlashGTEModel {
                 (pool, Some(classifier))
             }
             ModelType::Embedding(pool) => (pool, None),
+            ModelType::ListwiseReranker => unreachable!("ListwiseReranker not supported for FlashGTE"),
         };
 
         let (word_embeddings, token_type_embeddings, layers, embeddings_norm) =

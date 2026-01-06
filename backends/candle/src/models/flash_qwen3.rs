@@ -1,7 +1,7 @@
 use crate::flash_attn::flash_attn_varlen;
 use crate::layers::{get_cos_sin, get_inv_freqs, index_select, HiddenAct, Linear, RMSNorm};
 use crate::models::{Model, Qwen3Config};
-use candle::{DType, Device, IndexOp, Result, Tensor};
+use candle::{DType, Device, IndexOp, Result, Tensor, D};
 use candle_nn::{Embedding, Module, VarBuilder};
 use candle_rotary::apply_rotary_inplace;
 use text_embeddings_backend_core::{Batch, ModelType, Pool};
@@ -285,9 +285,11 @@ pub struct FlashQwen3Model {
     embeddings: Embedding,
     layers: Vec<Qwen3Layer>,
     norm: RMSNorm,
+    lm_head_weight: Tensor,
     cos_cache: Tensor,
     sin_cache: Tensor,
     pool: Pool,
+    model_type: ModelType,
     pub device: Device,
 
     span: tracing::Span,
@@ -304,11 +306,12 @@ impl FlashQwen3Model {
             candle::bail!("FlashQwen3 requires DType::F16")
         }
 
-        let pool = match model_type {
+        let pool = match &model_type {
             ModelType::Classifier => {
-                candle::bail!("`classifier` model type is not supported for Qwen3")
+                candle::bail!("Qwen3 Classifier not supported. Use ListwiseReranker for Qwen3-Reranker models.")
             }
-            ModelType::Embedding(pool) => pool,
+            ModelType::Embedding(pool) => pool.clone(),
+            ModelType::ListwiseReranker => Pool::LastToken,
         };
 
         // The Qwen3-Reranker models contain the `model` key
@@ -319,11 +322,13 @@ impl FlashQwen3Model {
             vb
         };
 
-        let embeddings = Embedding::new(
-            vb.pp("embed_tokens")
-                .get((config.vocab_size, config.hidden_size), "weight")?,
-            config.hidden_size,
-        );
+        let embed_weight = vb
+            .pp("embed_tokens")
+            .get((config.vocab_size, config.hidden_size), "weight")?;
+
+        let embeddings = Embedding::new(embed_weight.clone(), config.hidden_size);
+
+        let lm_head_weight = embed_weight;
 
         let layers = (0..config.num_hidden_layers)
             .map(|index| Qwen3Layer::load(vb.pp(format!("layers.{index}")), config))
@@ -348,9 +353,11 @@ impl FlashQwen3Model {
             embeddings,
             layers,
             norm,
+            lm_head_weight,
             cos_cache,
             sin_cache,
             pool,
+            model_type,
             device: vb.device().clone(),
             span: tracing::span!(tracing::Level::TRACE, "model"),
         })
@@ -400,8 +407,8 @@ impl FlashQwen3Model {
                 // CLS and LastToken pooling
                 Pool::Cls | Pool::LastToken => {
                     if batch_size > 1 {
-                        // Get token indices form cu_seqlens
-                        let mut indices = match self.pool {
+                        // Get token indices for each sequence
+                        let all_indices = match self.pool {
                             Pool::Cls => cu_seqlens.narrow(0, 0, batch_size)?,
                             Pool::LastToken => {
                                 let end = cu_seqlens.narrow(0, 1, batch_size)?;
@@ -410,19 +417,21 @@ impl FlashQwen3Model {
                             _ => unreachable!(),
                         };
 
-                        // If raw_indices is empty, we don't need to do anything with
-                        // the pooled_indices
-                        if has_raw_requests {
-                            // We need the pooled indices to select the correct cls indices
+                        // Select the appropriate indices based on pooled_indices
+                        let indices = if has_raw_requests {
+                            // Select only the sequences that need pooling
+                            let pooled_indices_vec: Vec<i64> = batch.pooled_indices.iter()
+                                .map(|&idx| idx as i64)
+                                .collect();
                             let pooled_indices = Tensor::from_vec(
-                                batch.pooled_indices.clone(),
+                                pooled_indices_vec,
                                 batch.pooled_indices.len(),
                                 &self.device,
                             )?;
-
-                            // Only select indices that requires pooling
-                            indices = index_select(&indices, &pooled_indices, 0)?
-                        }
+                            index_select(&all_indices, &pooled_indices, 0)?
+                        } else {
+                            all_indices
+                        };
 
                         // Select tokens
                         Some(index_select(&outputs, &indices, 0)?)
@@ -511,5 +520,80 @@ impl Model for FlashQwen3Model {
 
     fn embed(&self, batch: Batch) -> Result<(Option<Tensor>, Option<Tensor>)> {
         self.forward(batch)
+    }
+
+    fn predict(&self, batch: Batch) -> Result<Tensor> {
+        match &self.model_type {
+            ModelType::ListwiseReranker => {
+                let _enter = self.span.enter();
+
+                let batch_size = batch.cumulative_seq_lengths.len() - 1;
+                let shape = batch.input_ids.len();
+
+                let input_ids = Tensor::from_vec(batch.input_ids, shape, &self.device)?;
+                let position_ids = Tensor::from_vec(batch.position_ids, shape, &self.device)?;
+                let cu_seqlens = Tensor::from_vec(
+                    batch.cumulative_seq_lengths.clone(),
+                    batch_size + 1,
+                    &self.device,
+                )?;
+
+                let mut hidden_states = self.embeddings.forward(&input_ids)?;
+                tracing::debug!("predict: input_ids shape: {:?}, hidden_states shape: {:?}", input_ids.shape(), hidden_states.shape());
+
+                let cos = index_select(&self.cos_cache, &position_ids, 0)?;
+                let sin = index_select(&self.sin_cache, &position_ids, 0)?;
+                tracing::debug!("predict: cos shape: {:?}, sin shape: {:?}", cos.shape(), sin.shape());
+
+                let mut residual = None;
+                for layer in &self.layers {
+                    let (h, r) = layer.forward(
+                        &hidden_states,
+                        residual.as_ref(),
+                        &cu_seqlens,
+                        &cos,
+                        &sin,
+                        batch.max_length as usize,
+                    )?;
+                    hidden_states = h;
+                    residual = Some(r);
+                }
+                tracing::debug!("predict: after layers, hidden_states shape: {:?}", hidden_states.shape());
+
+                let (outputs, _) = self.norm.forward(&hidden_states, residual.as_ref())?;
+                tracing::debug!("predict: outputs shape: {:?}", outputs.shape());
+
+                let mut last_hidden_states = Vec::with_capacity(batch_size);
+
+                for i in 0..batch_size {
+                    let seq_end = batch.cumulative_seq_lengths[i + 1] as usize;
+                    let last_token_idx = seq_end - 1;
+
+                    let h_last = outputs.i(last_token_idx)?; // [hidden_size]
+                    last_hidden_states.push(h_last);
+                }
+
+                let h_last = Tensor::stack(&last_hidden_states, 0)?; // [bs, hidden_size]
+
+                // Correct token IDs for Qwen3 (verified from tokenizer)
+                // 'yes' -> 9693, 'no' -> 2152 (lowercase)
+                let yes_id = 9693u32; // "yes" token ID
+                let no_id = 2152u32; // "no" token ID
+
+                tracing::debug!("Using Qwen3 token IDs - yes: {}, no: {}", yes_id, no_id);
+
+                let ids = Tensor::from_vec(vec![no_id, yes_id], 2, &self.device)?;
+                let w = self.lm_head_weight.index_select(&ids, 0)?; // [2, hidden_size]
+                let logits = h_last.matmul(&w.t()?)?; // [bs, 2] (no, yes)
+                
+                let log_probs = candle_nn::ops::log_softmax(&logits, D::Minus1)?;
+                let scores = log_probs.i((.., 1))?.exp()?.unsqueeze(D::Minus1)?; // P("yes") ∈ (0,1), shape: [bs, 1]
+
+                Ok(scores)
+            }
+            _ => {
+                candle::bail!("`predict` is only implemented for ListwiseReranker")
+            }
+        }
     }
 }

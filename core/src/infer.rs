@@ -1,7 +1,10 @@
 use crate::queue::{Entry, Metadata, NextBatch, Queue};
 use crate::tokenization::{EncodingInput, RawEncoding, Tokenization};
 use crate::TextEmbeddingsError;
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
 use std::time::{Duration, Instant};
 use text_embeddings_backend::{Backend, BackendError, Embedding, ModelType};
 use tokenizers::TruncationDirection;
@@ -122,6 +125,7 @@ impl Infer {
         truncation_direction: TruncationDirection,
         prompt_name: Option<String>,
         permit: OwnedSemaphorePermit,
+        batch_counter: Option<Arc<AtomicUsize>>,
     ) -> Result<AllEmbeddingsInferResponse, TextEmbeddingsError> {
         let start_time = Instant::now();
 
@@ -144,6 +148,7 @@ impl Infer {
                 false,
                 &start_time,
                 permit,
+                batch_counter,
             )
             .await?;
 
@@ -173,6 +178,7 @@ impl Infer {
         truncation_direction: TruncationDirection,
         prompt_name: Option<String>,
         permit: OwnedSemaphorePermit,
+        batch_counter: Option<Arc<AtomicUsize>>,
     ) -> Result<PooledEmbeddingsInferResponse, TextEmbeddingsError> {
         let start_time = Instant::now();
 
@@ -195,6 +201,7 @@ impl Infer {
                 true,
                 &start_time,
                 permit,
+                batch_counter,
             )
             .await?;
 
@@ -231,6 +238,7 @@ impl Infer {
         normalize: bool,
         dimensions: Option<usize>,
         permit: OwnedSemaphorePermit,
+        batch_counter: Option<Arc<AtomicUsize>>,
     ) -> Result<PooledEmbeddingsInferResponse, TextEmbeddingsError> {
         let start_time = Instant::now();
 
@@ -263,6 +271,7 @@ impl Infer {
                 true,
                 &start_time,
                 permit,
+                batch_counter,
             )
             .await?;
 
@@ -330,6 +339,7 @@ impl Infer {
         pooling: bool,
         start_time: &Instant,
         _permit: OwnedSemaphorePermit,
+        batch_counter: Option<Arc<AtomicUsize>>,
     ) -> Result<InferResult, TextEmbeddingsError> {
         if self.is_classifier() {
             let counter = metrics::counter!("te_request_failure", "err" => "model_type");
@@ -371,7 +381,14 @@ impl Infer {
             encoding,
         });
 
-        self.notify_batching_task.notify_one();
+        match batch_counter {
+            None => self.notify_batching_task.notify_one(),
+            Some(counter) => {
+                if counter.fetch_sub(1, Ordering::SeqCst) == 1 {
+                    self.notify_batching_task.notify_one();
+                }
+            }
+        }
 
         let response = response_rx
             .await
@@ -396,6 +413,7 @@ impl Infer {
         truncation_direction: TruncationDirection,
         raw_scores: bool,
         _permit: OwnedSemaphorePermit,
+        batch_counter: Option<Arc<AtomicUsize>>,
     ) -> Result<ClassificationInferResponse, TextEmbeddingsError> {
         if !self.is_classifier() {
             let counter = metrics::counter!("te_request_failure", "err" => "model_type");
@@ -437,7 +455,14 @@ impl Infer {
             encoding,
         });
 
-        self.notify_batching_task.notify_one();
+        match batch_counter {
+            None => self.notify_batching_task.notify_one(),
+            Some(counter) => {
+                if counter.fetch_sub(1, Ordering::SeqCst) == 1 {
+                    self.notify_batching_task.notify_one();
+                }
+            }
+        }
 
         let response = response_rx
             .await
@@ -455,7 +480,14 @@ impl Infer {
             panic!("unexpected enum variant")
         };
 
-        if !raw_scores {
+        // For ListwiseReranker, the model already returns P(yes) probability
+        // No need to apply sigmoid/softmax transformation
+        let is_listwise_reranker = matches!(
+            self.backend.model_type,
+            text_embeddings_backend::ModelType::ListwiseReranker
+        );
+
+        if !raw_scores && !is_listwise_reranker {
             // Softmax
             if response.results.len() > 1 {
                 let max = *response
@@ -499,7 +531,10 @@ impl Infer {
 
     #[instrument(skip(self))]
     pub fn is_classifier(&self) -> bool {
-        matches!(self.backend.model_type, ModelType::Classifier)
+        matches!(
+            self.backend.model_type,
+            ModelType::Classifier | ModelType::ListwiseReranker
+        )
     }
 
     #[instrument(skip(self))]
@@ -547,7 +582,7 @@ async fn batching_task(queue: Queue, notify: Arc<Notify>, embed_sender: mpsc::Se
 async fn backend_task(backend: Backend, mut embed_receiver: mpsc::Receiver<NextBatch>) {
     while let Some(batch) = embed_receiver.recv().await {
         match &backend.model_type {
-            ModelType::Classifier => {
+            ModelType::Classifier | ModelType::ListwiseReranker => {
                 let results = backend.predict(batch.1).await;
 
                 // Handle sending responses in a blocking task to avoid starving the backend

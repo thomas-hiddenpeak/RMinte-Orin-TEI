@@ -228,6 +228,7 @@ impl FlashNomicBertModel {
                 }
                 pool
             }
+            ModelType::ListwiseReranker => unreachable!("ListwiseReranker not supported for FlashNomic"),
         };
 
         let embeddings = NomicBertEmbeddings::load(vb.clone(), config)?;

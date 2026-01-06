@@ -173,7 +173,9 @@ impl Backend {
         for shape in shapes.iter() {
             let batch = self.create_warmup_batch(*shape, max_token as u32, seq_bucket_size as u32);
             match &self.model_type {
-                ModelType::Classifier => self.predict(batch).await.map(|_| ()),
+                ModelType::Classifier | ModelType::ListwiseReranker => {
+                    self.predict(batch).await.map(|_| ())
+                }
                 ModelType::Embedding(_) => self.embed(batch).await.map(|_| ()),
             }?;
             tracing::info!("finish warmup for batch: {}, length: {}", shape.0, shape.1);
@@ -292,7 +294,9 @@ impl Backend {
         };
 
         match &self.model_type {
-            ModelType::Classifier => self.predict(batch).await.map(|_| ()),
+            ModelType::Classifier | ModelType::ListwiseReranker => {
+                self.predict(batch).await.map(|_| ())
+            }
             ModelType::Embedding(_) => self.embed(batch).await.map(|_| ()),
         }
     }
@@ -314,18 +318,22 @@ impl Backend {
         } else {
             // The backend is un-healthy or only just started. Do a more advanced health check
             // by calling the model forward on a test batch
+            // Use at least 2 tokens to ensure the tensor has proper shape for CUDA kernels
+            // that use flatten_to(D::Minus2) which requires at least 2 dimensions
 
             let batch = Batch {
-                input_ids: vec![0],
-                token_type_ids: vec![0],
-                position_ids: vec![0],
-                cumulative_seq_lengths: vec![0, 1],
-                max_length: 1,
+                input_ids: vec![0, 0],
+                token_type_ids: vec![0, 0],
+                position_ids: vec![0, 1],
+                cumulative_seq_lengths: vec![0, 2],
+                max_length: 2,
                 pooled_indices: vec![0],
                 raw_indices: vec![],
             };
             match &self.model_type {
-                ModelType::Classifier => self.predict(batch).await.map(|_| ()),
+                ModelType::Classifier | ModelType::ListwiseReranker => {
+                    self.predict(batch).await.map(|_| ())
+                }
                 ModelType::Embedding(_) => self.embed(batch).await.map(|_| ()),
             }
         }
@@ -597,6 +605,13 @@ async fn download_safetensors(api: Arc<ApiRepo>) -> Result<Vec<PathBuf>, ApiErro
     match api.get("model.safetensors").await {
         Ok(p) => return Ok(vec![p]),
         Err(err) => tracing::warn!("Could not download `model.safetensors`: {}", err),
+    };
+
+    // StaticEmbedding fallback
+    tracing::info!("Downloading `0_StaticEmbedding/model.safetensors`");
+    match api.get("0_StaticEmbedding/model.safetensors").await {
+        Ok(p) => return Ok(vec![p]),
+        Err(err) => tracing::warn!("Could not download `0_StaticEmbedding/model.safetensors`: {}", err),
     };
 
     // Sharded weights

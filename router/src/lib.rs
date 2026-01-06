@@ -107,19 +107,21 @@ pub async fn run(
         serde_json::from_str(&config).context("Failed to parse `config.json`")?;
 
     // Set model type from config
-    let backend_model_type = get_backend_model_type(&config, &model_root, pooling)?;
+    let backend_model_type = get_backend_model_type(&config, &model_root, &model_id, pooling)?;
 
     // Info model type
     let model_type = match &backend_model_type {
         text_embeddings_backend::ModelType::Classifier => {
             let id2label = config
                 .id2label
+                .clone()
                 .context("`config.json` does not contain `id2label`")?;
             let n_classes = id2label.len();
             let classifier_model = ClassifierModel {
                 id2label,
                 label2id: config
                     .label2id
+                    .clone()
                     .context("`config.json` does not contain `label2id`")?,
             };
             if n_classes > 1 {
@@ -127,6 +129,16 @@ pub async fn run(
             } else {
                 ModelType::Reranker(classifier_model)
             }
+        }
+        text_embeddings_backend::ModelType::ListwiseReranker => {
+            // For Qwen3 reranker, we don't have id2label/label2id
+            // Create a dummy classifier model
+            ModelType::ListwiseReranker(ClassifierModel {
+                id2label: [("0".to_string(), "positive".to_string())]
+                    .into_iter()
+                    .collect(),
+                label2id: [("positive".to_string(), 0)].into_iter().collect(),
+            })
         }
         text_embeddings_backend::ModelType::Embedding(pool) => {
             ModelType::Embedding(EmbeddingModel {
@@ -394,8 +406,46 @@ pub async fn run(
 fn get_backend_model_type(
     config: &ModelConfig,
     model_root: &Path,
+    model_id: &str,
     pooling: Option<text_embeddings_backend::Pool>,
 ) -> Result<text_embeddings_backend::ModelType> {
+    // Check for reranker models using config-based detection
+    // 1. Explicit is_reranker flag
+    if config.is_reranker == Some(true) {
+        tracing::info!("Detected reranker model from config.is_reranker flag");
+        if pooling.is_some() {
+            tracing::warn!(
+                "`--pooling` arg is set but model is a reranker. Ignoring `--pooling` arg."
+            );
+        }
+        return Ok(text_embeddings_backend::ModelType::ListwiseReranker);
+    }
+
+    // 2. Fallback to name-based detection for Qwen3 models
+    if config
+        .architectures
+        .iter()
+        .any(|arch| arch == "Qwen3ForCausalLM")
+    {
+        // Check if the model ID contains "reranker"
+        let model_name = model_id
+            .trim_end_matches('/')
+            .split('/')
+            .last()
+            .unwrap_or(model_id)
+            .to_lowercase();
+
+        if model_name.contains("reranker") {
+            tracing::info!("Detected Qwen3-Reranker model from model name");
+            if pooling.is_some() {
+                tracing::warn!(
+                    "`--pooling` arg is set but model is a reranker. Ignoring `--pooling` arg."
+                );
+            }
+            return Ok(text_embeddings_backend::ModelType::ListwiseReranker);
+        }
+    }
+
     for arch in &config.architectures {
         // Edge case affecting `Alibaba-NLP/gte-multilingual-base` and possibly other fine-tunes of
         // the same base model. More context at https://huggingface.co/Alibaba-NLP/gte-multilingual-base/discussions/7
@@ -410,6 +460,13 @@ fn get_backend_model_type(
             return Ok(text_embeddings_backend::ModelType::Embedding(
                 text_embeddings_backend::Pool::Splade,
             ));
+        } else if arch == "Qwen3ForSequenceClassification" {
+            if pooling.is_some() {
+                tracing::warn!(
+                    "`--pooling` arg is set but model is a reranker. Ignoring `--pooling` arg."
+                );
+            }
+            return Ok(text_embeddings_backend::ModelType::ListwiseReranker);
         } else if arch.ends_with("Classification") {
             if pooling.is_some() {
                 tracing::warn!(
@@ -464,6 +521,8 @@ pub struct ModelConfig {
     pub id2label: Option<HashMap<String, String>>,
     pub label2id: Option<HashMap<String, usize>>,
     pub auto_map: Option<HashMap<String, String>>,
+    // Reranker-specific field
+    pub is_reranker: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -524,6 +583,7 @@ pub enum ModelType {
     Classifier(ClassifierModel),
     Embedding(EmbeddingModel),
     Reranker(ClassifierModel),
+    ListwiseReranker(ClassifierModel),
 }
 
 #[derive(Clone, Debug, Serialize)]

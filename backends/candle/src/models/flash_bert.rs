@@ -259,6 +259,7 @@ impl FlashBertModel {
                 };
                 (pool, None, splade)
             }
+            ModelType::ListwiseReranker => unreachable!("ListwiseReranker not supported for FlashBert"),
         };
 
         let (embeddings, encoder) = match (
@@ -326,6 +327,7 @@ impl FlashBertModel {
                 };
                 (pool, None, splade)
             }
+            ModelType::ListwiseReranker => unreachable!("ListwiseReranker not supported for FlashBert"),
         };
 
         let (embeddings, encoder) = match (

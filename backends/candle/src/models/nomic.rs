@@ -697,6 +697,7 @@ impl NomicBertModel {
                 }
                 pool
             }
+            ModelType::ListwiseReranker => unreachable!("ListwiseReranker not supported for Nomic"),
         };
 
         let embeddings = NomicBertEmbeddings::load(vb.clone(), config)?;

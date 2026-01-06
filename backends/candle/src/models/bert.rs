@@ -597,6 +597,7 @@ impl BertModel {
                 };
                 (pool, None, splade)
             }
+            ModelType::ListwiseReranker => unreachable!("ListwiseReranker not supported for Bert"),
         };
 
         let (embeddings, encoder) = match (
@@ -661,6 +662,7 @@ impl BertModel {
                 };
                 (pool, None, splade)
             }
+            ModelType::ListwiseReranker => unreachable!("ListwiseReranker not supported for Bert"),
         };
 
         let (embeddings, encoder) = match (

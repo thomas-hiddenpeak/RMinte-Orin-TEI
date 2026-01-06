@@ -29,6 +29,7 @@ use http::header::AUTHORIZATION;
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use simsimd::SpatialSimilarity;
 use std::net::SocketAddr;
+use std::sync::{atomic::AtomicUsize, Arc};
 use std::time::{Duration, Instant};
 use text_embeddings_backend::BackendError;
 use text_embeddings_core::infer::{
@@ -119,7 +120,8 @@ async fn predict(
                               truncate: bool,
                               infer: Infer,
                               info: Info,
-                              permit: Option<OwnedSemaphorePermit>| async move {
+                              permit: Option<OwnedSemaphorePermit>,
+                              _batch_counter: Option<Arc<AtomicUsize>>| async move {
         let permit = match permit {
             None => infer.try_acquire_permit().map_err(ErrorResponse::from)?,
             Some(permit) => permit,
@@ -132,6 +134,7 @@ async fn predict(
                 req.truncation_direction.into(),
                 req.raw_scores,
                 permit,
+                None,
             )
             .await
             .map_err(ErrorResponse::from)?;
@@ -139,6 +142,7 @@ async fn predict(
         let id2label = match &info.model_type {
             ModelType::Classifier(classifier) => &classifier.id2label,
             ModelType::Reranker(classifier) => &classifier.id2label,
+            ModelType::ListwiseReranker(classifier) => &classifier.id2label,
             _ => panic!(),
         };
 
@@ -180,7 +184,7 @@ async fn predict(
             let compute_chars = inputs.count_chars();
             let permit = infer.try_acquire_permit().map_err(ErrorResponse::from)?;
             let (prompt_tokens, tokenization, queue, inference, predictions) =
-                predict_inner(inputs, truncate, infer.0, info.0, Some(permit)).await?;
+                predict_inner(inputs, truncate, infer.0, info.0, Some(permit), None).await?;
 
             let counter = metrics::counter!("te_request_count", "method" => "single");
             counter.increment(1);
@@ -217,6 +221,11 @@ async fn predict(
                 Err(err)?;
             }
 
+            let batch_counter = if batch_size == 1 {
+                None
+            } else {
+                Some(Arc::new(AtomicUsize::new(batch_size)))
+            };
             let mut futures = Vec::with_capacity(batch_size);
             let mut compute_chars = 0;
 
@@ -224,12 +233,14 @@ async fn predict(
                 compute_chars += input.count_chars();
                 let local_infer = infer.clone();
                 let local_info = info.clone();
+                let local_batch_counter = batch_counter.clone();
                 futures.push(predict_inner(
                     input,
                     truncate,
                     local_infer.0,
                     local_info.0,
                     None,
+                    local_batch_counter,
                 ))
             }
             let results = join_all(futures).await.into_iter().collect::<Result<
@@ -330,7 +341,7 @@ async fn rerank(
     }
 
     match &info.model_type {
-        ModelType::Reranker(_) => Ok(()),
+        ModelType::Reranker(_) | ModelType::ListwiseReranker(_) => Ok(()),
         ModelType::Classifier(_) | ModelType::Embedding(_) => {
             let counter = metrics::counter!("te_request_failure", "err" => "model_type");
             counter.increment(1);
@@ -345,17 +356,49 @@ async fn rerank(
         ErrorResponse::from(err)
     })?;
 
+    // Apply template if needed for Qwen3 rerankers
+    let model_id = info.model_id.clone();
+    let use_template = req.use_template.unwrap_or_else(|| {
+        // Default to true for Qwen3 sequence classification models
+        text_embeddings_core::templates::requires_template(&model_id)
+    });
+    tracing::info!("Rerank request: model_id={}, use_template={}", model_id, use_template);
+
     // Closure for rerank
-    let rerank_inner = move |query: String, text: String, truncate: bool, infer: Infer| async move {
+    let rerank_inner = move |query: String,
+                             text: String,
+                             truncate: bool,
+                             instruction: Option<String>,
+                             model_id: String,
+                             infer: Infer,
+                             batch_counter: Option<Arc<AtomicUsize>>| async move {
         let permit = infer.try_acquire_permit().map_err(ErrorResponse::from)?;
+
+        // Apply template formatting if needed
+        let input: text_embeddings_core::tokenization::EncodingInput = if use_template {
+            if let Some(formatter) = text_embeddings_core::templates::get_template_formatter(&model_id) {
+                // Format as single string with template
+                let formatted = formatter.format_rerank(&query, &text, instruction.as_deref());
+                tracing::debug!("Template applied, formatted length: {} chars", formatted.len());
+                formatted.into()
+            } else {
+                tracing::warn!("use_template=true but no formatter for model_id={}", model_id);
+                // No template, use dual input
+                (query, text).into()
+            }
+        } else {
+            // Template disabled, use dual input
+            (query, text).into()
+        };
 
         let response = infer
             .predict(
-                (query, text),
+                input,
                 truncate,
                 req.truncation_direction.into(),
                 req.raw_scores,
                 permit,
+                batch_counter,
             )
             .await
             .map_err(ErrorResponse::from)?;
@@ -393,6 +436,11 @@ async fn rerank(
             Err(err)?;
         }
 
+        let batch_counter = if batch_size == 1 {
+            None
+        } else {
+            Some(Arc::new(AtomicUsize::new(batch_size)))
+        };
         let mut futures = Vec::with_capacity(batch_size);
         let query_chars = req.query.chars().count();
         let mut compute_chars = query_chars * batch_size;
@@ -400,11 +448,15 @@ async fn rerank(
         for text in &req.texts {
             compute_chars += text.chars().count();
             let local_infer = infer.clone();
+            let local_batch_counter = batch_counter.clone();
             futures.push(rerank_inner(
                 req.query.clone(),
                 text.clone(),
                 truncate,
+                req.instruction.clone(),
+                model_id.clone(),
                 local_infer.0,
+                local_batch_counter,
             ))
         }
         let results = join_all(futures)
@@ -614,6 +666,7 @@ async fn embed(
                     req.normalize,
                     req.dimensions,
                     permit,
+                    None,
                 )
                 .await
                 .map_err(ErrorResponse::from)?;
@@ -664,6 +717,11 @@ async fn embed(
                 Err(err)?;
             }
 
+            let batch_counter = if batch_size == 1 {
+                None
+            } else {
+                Some(Arc::new(AtomicUsize::new(batch_size)))
+            };
             let mut futures = Vec::with_capacity(batch_size);
             let mut compute_chars = 0;
 
@@ -672,6 +730,7 @@ async fn embed(
 
                 let local_infer = infer.clone();
                 let prompt_name = req.prompt_name.clone();
+                let local_batch_counter = batch_counter.clone();
 
                 let permit = local_infer
                     .try_acquire_permit()
@@ -687,6 +746,7 @@ async fn embed(
                             req.normalize,
                             req.dimensions,
                             permit,
+                            local_batch_counter,
                         )
                         .await
                 })
@@ -801,6 +861,7 @@ async fn embed_sparse(
                     req.truncation_direction.into(),
                     req.prompt_name,
                     permit,
+                    None,
                 )
                 .await
                 .map_err(ErrorResponse::from)?;
@@ -851,6 +912,11 @@ async fn embed_sparse(
                 Err(err)?;
             }
 
+            let batch_counter = if batch_size == 1 {
+                None
+            } else {
+                Some(Arc::new(AtomicUsize::new(batch_size)))
+            };
             let mut futures = Vec::with_capacity(batch_size);
             let mut compute_chars = 0;
 
@@ -859,6 +925,7 @@ async fn embed_sparse(
 
                 let local_infer = infer.clone();
                 let prompt_name = req.prompt_name.clone();
+                let local_batch_counter = batch_counter.clone();
 
                 let permit = local_infer
                     .try_acquire_permit()
@@ -872,6 +939,7 @@ async fn embed_sparse(
                             req.truncation_direction.into(),
                             prompt_name,
                             permit,
+                            local_batch_counter,
                         )
                         .await?;
                     Ok((sparsify(response.results), response.metadata))
@@ -979,6 +1047,7 @@ async fn embed_all(
                     req.truncation_direction.into(),
                     req.prompt_name,
                     permit,
+                    None,
                 )
                 .await
                 .map_err(ErrorResponse::from)?;
@@ -1029,6 +1098,11 @@ async fn embed_all(
                 Err(err)?;
             }
 
+            let batch_counter = if batch_size == 1 {
+                None
+            } else {
+                Some(Arc::new(AtomicUsize::new(batch_size)))
+            };
             let mut futures = Vec::with_capacity(batch_size);
             let mut compute_chars = 0;
 
@@ -1037,6 +1111,7 @@ async fn embed_all(
 
                 let local_infer = infer.clone();
                 let prompt_name = req.prompt_name.clone();
+                let local_batch_counter = batch_counter.clone();
 
                 let permit = local_infer
                     .try_acquire_permit()
@@ -1050,6 +1125,7 @@ async fn embed_all(
                             req.truncation_direction.into(),
                             prompt_name,
                             permit,
+                            local_batch_counter,
                         )
                         .await
                 })
@@ -1173,6 +1249,7 @@ async fn openai_embed(
                     true,
                     req.dimensions,
                     permit,
+                    None,
                 )
                 .await
                 .map_err(ErrorResponse::from)?;
@@ -1228,6 +1305,11 @@ async fn openai_embed(
                 Err(err)?;
             }
 
+            let batch_counter = if batch_size == 1 {
+                None
+            } else {
+                Some(Arc::new(AtomicUsize::new(batch_size)))
+            };
             let mut futures = Vec::with_capacity(batch_size);
             let mut compute_chars = 0;
 
@@ -1235,6 +1317,7 @@ async fn openai_embed(
                 compute_chars += input.count_chars();
 
                 let local_infer = infer.clone();
+                let local_batch_counter = batch_counter.clone();
 
                 let permit = local_infer
                     .try_acquire_permit()
@@ -1250,6 +1333,7 @@ async fn openai_embed(
                             true,
                             req.dimensions,
                             permit,
+                            local_batch_counter,
                         )
                         .await
                 })
@@ -1567,7 +1651,7 @@ async fn vertex_compatibility(
         }
 
         match info.model_type {
-            ModelType::Classifier(_) | ModelType::Reranker(_) => {
+            ModelType::Classifier(_) | ModelType::Reranker(_) | ModelType::ListwiseReranker(_) => {
                 let instance = serde_json::from_value::<PredictRequest>(instance)
                     .map_err(ErrorResponse::from)?;
                 futures
@@ -1798,7 +1882,7 @@ pub async fn run(
                     // AWS Sagemaker route
                     .route("/invocations", post(predict))
             }
-            ModelType::Reranker(_) => {
+            ModelType::Reranker(_) | ModelType::ListwiseReranker(_) => {
                 routes
                     .route("/", post(rerank))
                     // AWS Sagemaker route

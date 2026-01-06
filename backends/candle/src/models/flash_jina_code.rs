@@ -314,6 +314,7 @@ impl FlashJinaCodeBertModel {
                 }
                 pool
             }
+            ModelType::ListwiseReranker => unreachable!("ListwiseReranker not supported for FlashJinaCode"),
         };
 
         let (embeddings, encoder) = match (

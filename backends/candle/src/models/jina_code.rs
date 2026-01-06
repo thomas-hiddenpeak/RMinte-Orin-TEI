@@ -364,6 +364,7 @@ impl JinaCodeBertModel {
                 }
                 pool
             }
+            ModelType::ListwiseReranker => unreachable!("ListwiseReranker not supported for JinaCode"),
         };
 
         let (embeddings, encoder) = match (
