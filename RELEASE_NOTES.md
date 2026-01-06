@@ -41,18 +41,30 @@ Comparison between TEI and Transformers reference implementation:
 curl -sSL https://github.com/thomas-hiddenpeak/RMinte-Orin-TEI/releases/download/v0.6.0-qwen3-reranker-orin/install-sm87.sh | bash
 ```
 
-Or with custom install directory:
+Or with options:
 ```bash
-INSTALL_DIR=~/bin curl -sSL https://github.com/thomas-hiddenpeak/RMinte-Orin-TEI/releases/download/v0.6.0-qwen3-reranker-orin/install-sm87.sh | bash
+# Force overwrite existing installation
+curl -sSL .../install-sm87.sh | bash -s -- --force
+
+# Custom install directory
+INSTALL_DIR=/usr/local/bin curl -sSL .../install-sm87.sh | bash
+
+# Non-interactive force install (for scripts/CI)
+FORCE_INSTALL=true curl -sSL .../install-sm87.sh | bash
 ```
 
 The script will:
 - ✅ Check architecture (aarch64)
 - ✅ Verify CUDA and compute capability
 - ✅ Check required libraries
+- ✅ Ensure `~/.cargo/bin` directory exists
+- ✅ Detect existing installation and prompt for overwrite
+- ✅ Create backup of existing binary before overwrite
 - ✅ Download the binary from GitHub
-- ✅ Install to `/usr/local/bin` (or custom path)
+- ✅ Install to `~/.cargo/bin` (Cargo default)
 - ✅ Verify installation
+
+**Default install path**: `~/.cargo/bin/text-embeddings-router` (same as Cargo)
 
 ### Manual Installation
 

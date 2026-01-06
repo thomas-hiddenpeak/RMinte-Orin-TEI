@@ -12,8 +12,9 @@ set -e
 REPO="thomas-hiddenpeak/RMinte-Orin-TEI"
 RELEASE_TAG="v0.6.0-qwen3-reranker-orin"
 BINARY_NAME="text-embeddings-router"
-INSTALL_DIR="${INSTALL_DIR:-/usr/local/bin}"
+INSTALL_DIR="${INSTALL_DIR:-$HOME/.cargo/bin}"
 TMP_DIR="/tmp/tei-install"
+FORCE_INSTALL="${FORCE_INSTALL:-false}"
 
 # Colors for output
 RED='\033[0;31m'
@@ -96,6 +97,70 @@ check_dependencies() {
         print_warn "Please ensure CUDA toolkit is properly installed"
     else
         print_step "All required libraries found"
+    fi
+}
+
+# Check for existing installation
+check_existing_installation() {
+    local target_path="$INSTALL_DIR/$BINARY_NAME"
+    
+    if [[ -f "$target_path" ]]; then
+        print_warn "Existing installation found: $target_path"
+        
+        # Try to get version info
+        local existing_version=""
+        if "$target_path" --version &> /dev/null; then
+            existing_version=$("$target_path" --version 2>&1 | head -1)
+            print_info "Existing version: $existing_version"
+        fi
+        
+        if [[ "$FORCE_INSTALL" == "true" ]]; then
+            print_info "Force install enabled, will overwrite existing installation"
+            return 0
+        fi
+        
+        # Interactive prompt (only if stdin is a terminal)
+        if [[ -t 0 ]]; then
+            echo ""
+            echo -e "${YELLOW}An existing installation was found.${NC}"
+            echo -e "  Current: $target_path"
+            echo -e "  New version: $RELEASE_TAG"
+            echo ""
+            read -p "Do you want to overwrite it? [y/N] " -n 1 -r
+            echo ""
+            
+            if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+                print_info "Installation cancelled by user"
+                exit 0
+            fi
+            
+            # Backup existing binary
+            local backup_path="${target_path}.backup.$(date +%Y%m%d%H%M%S)"
+            print_info "Creating backup: $backup_path"
+            cp "$target_path" "$backup_path"
+            print_step "Backup created"
+        else
+            # Non-interactive mode without FORCE_INSTALL
+            print_error "Existing installation found. Use FORCE_INSTALL=true to overwrite"
+            print_info "Example: FORCE_INSTALL=true $0"
+            exit 1
+        fi
+    fi
+}
+
+# Ensure install directory exists
+ensure_install_dir() {
+    if [[ ! -d "$INSTALL_DIR" ]]; then
+        print_info "Creating install directory: $INSTALL_DIR"
+        mkdir -p "$INSTALL_DIR"
+        print_step "Directory created"
+    fi
+    
+    # Check if directory is in PATH
+    if [[ ":$PATH:" != *":$INSTALL_DIR:"* ]]; then
+        print_warn "$INSTALL_DIR is not in your PATH"
+        print_info "Add this to your shell profile (~/.bashrc or ~/.zshrc):"
+        echo -e "    ${YELLOW}export PATH=\"\$HOME/.cargo/bin:\$PATH\"${NC}"
     fi
 }
 
@@ -205,6 +270,8 @@ main() {
     check_architecture
     check_cuda
     check_dependencies
+    ensure_install_dir
+    check_existing_installation
     download_binary
     install_binary
     verify_installation
@@ -222,13 +289,17 @@ case "${1:-}" in
         echo "Options:"
         echo "  --help, -h     Show this help message"
         echo "  --version, -v  Show version information"
+        echo "  --force, -f    Force install, overwrite existing installation"
         echo ""
         echo "Environment Variables:"
-        echo "  INSTALL_DIR    Installation directory (default: /usr/local/bin)"
+        echo "  INSTALL_DIR      Installation directory (default: ~/.cargo/bin)"
+        echo "  FORCE_INSTALL    Set to 'true' to skip overwrite confirmation"
         echo ""
         echo "Examples:"
-        echo "  $0                           # Install to /usr/local/bin"
-        echo "  INSTALL_DIR=~/bin $0         # Install to ~/bin"
+        echo "  $0                              # Install to ~/.cargo/bin"
+        echo "  $0 --force                      # Force overwrite existing"
+        echo "  INSTALL_DIR=/usr/local/bin $0   # Install to /usr/local/bin"
+        echo "  FORCE_INSTALL=true $0           # Non-interactive force install"
         exit 0
         ;;
     --version|-v)
@@ -236,6 +307,10 @@ case "${1:-}" in
         echo "Release: $RELEASE_TAG"
         echo "Repository: $REPO"
         exit 0
+        ;;
+    --force|-f)
+        FORCE_INSTALL=true
+        main
         ;;
     *)
         main
